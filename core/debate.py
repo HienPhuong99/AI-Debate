@@ -6,7 +6,7 @@ import json
 import re
 import unicodedata
 from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -27,13 +27,19 @@ MIN_TOKEN_BUDGET = 5_000
 MAX_TOKEN_BUDGET = 200_000
 DEFAULT_TOKEN_BUDGET = 60_000
 
+MAX_PERSONA_CHARS = 200
 PROVIDERS = ("Claude", "Gemini")
+LANGUAGES = {"auto": "Theo ngôn ngữ của task", "vi": "Tiếng Việt", "en": "English"}
+LANGUAGE_RULES = {
+    "auto": "Trả lời bằng ngôn ngữ của task, súc tích.",
+    "vi": "Luôn trả lời bằng tiếng Việt, súc tích.",
+    "en": "Always answer in English, concisely.",
+}
 
 PROPOSER_SYSTEM = """Bạn là bên ĐỀ XUẤT trong một cuộc thảo luận giữa hai AI để giải quyết task của người dùng.
 - Vòng đầu: đưa ra giải pháp cụ thể, có thể làm theo được ngay.
 - Các vòng sau: xét TỪNG điểm yếu mà bên kia vừa nêu. Điểm nào đúng thì sửa giải pháp; điểm nào sai thì bác bỏ kèm lý do cụ thể. Không được đồng ý chung chung cho xong, không xin lỗi rườm rà.
-- Định dạng Markdown: "## Đề xuất" (bản đầy đủ hiện tại), và từ vòng 2 thêm "## Phản hồi phản biện" (mỗi điểm: chấp nhận/bác bỏ + lý do).
-- Trả lời bằng ngôn ngữ của task, súc tích."""
+- Định dạng Markdown: "## Đề xuất" (bản đầy đủ hiện tại), và từ vòng 2 thêm "## Phản hồi phản biện" (mỗi điểm: chấp nhận/bác bỏ + lý do)."""
 
 CRITIC_SYSTEM = f"""Bạn là bên PHẢN BIỆN trong một cuộc thảo luận giữa hai AI. Bạn CHỈ phản biện, không viết lại giải pháp thay bên đề xuất.
 Quy tắc bắt buộc:
@@ -46,19 +52,28 @@ Quy tắc bắt buộc:
 2. ...
 ## Gợi ý sửa
 - ...
-Trả lời bằng ngôn ngữ của task, súc tích."""
+Điểm: X/10
+Dòng cuối "Điểm: X/10" là bắt buộc: chấm chất lượng đề xuất hiện tại (10 = dùng được ngay, không còn điểm yếu đáng kể). Chấm thẳng tay; điểm cao KHÔNG miễn yêu cầu nêu điểm yếu."""
 
 SYNTH_SYSTEM = """Bạn là bên TỔNG HỢP. Dựa trên toàn bộ cuộc thảo luận, viết KẾT QUẢ CUỐI CÙNG hoàn chỉnh cho task của người dùng.
 - Dùng đề xuất mới nhất làm nền, áp dụng các phản biện hợp lý, bỏ các phản biện đã bị bác bỏ có lý.
 - Kết quả phải dùng được ngay, không kể lại quá trình tranh luận.
 - Cuối cùng thêm mục ngắn "## Điểm còn tranh cãi / rủi ro" (nếu có).
-- Markdown, bằng ngôn ngữ của task."""
+- Định dạng Markdown."""
 
 ROLE_LABELS = {"proposer": "Đề xuất", "critic": "Phản biện", "synthesizer": "Tổng hợp"}
 
 
 def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, int(value)))
+
+
+def parse_score(text: str) -> float | None:
+    """The critic's 'Điểm: X/10' line (last one wins), clamped to 0..10."""
+    matches = re.findall(r"Điểm\s*:?\s*\**\s*(\d+(?:[.,]\d+)?)\s*/\s*10", text, re.IGNORECASE)
+    if not matches:
+        return None
+    return max(0.0, min(10.0, float(matches[-1].replace(",", "."))))
 
 
 def count_weaknesses(text: str) -> int:
@@ -84,6 +99,10 @@ class DebateConfig:
     proposer: str = "Claude"
     synthesizer: str = "Claude"
     token_budget: int = DEFAULT_TOKEN_BUDGET
+    language: str = "auto"
+    proposer_persona: str = ""
+    critic_persona: str = ""
+    stop_score: int = 0  # 0 = off; else skip to synthesis once the critic scores >= this
 
     def __post_init__(self) -> None:
         self.task = (self.task or "").strip()
@@ -96,6 +115,13 @@ class DebateConfig:
         self.rounds = clamp(self.rounds, MIN_ROUNDS, MAX_ROUNDS)
         self.max_tokens = clamp(self.max_tokens, MIN_MAX_TOKENS, MAX_TOKENS_CAP)
         self.token_budget = clamp(self.token_budget, MIN_TOKEN_BUDGET, MAX_TOKEN_BUDGET)
+        if self.language not in LANGUAGES:
+            raise ValueError(f"Ngôn ngữ không hỗ trợ: {self.language}")
+        self.proposer_persona = (self.proposer_persona or "").strip()
+        self.critic_persona = (self.critic_persona or "").strip()
+        if max(len(self.proposer_persona), len(self.critic_persona)) > MAX_PERSONA_CHARS:
+            raise ValueError(f"Vai chuyên môn tối đa {MAX_PERSONA_CHARS} ký tự.")
+        self.stop_score = clamp(self.stop_score, 0, 10)
 
     @property
     def critic(self) -> str:
@@ -114,13 +140,18 @@ class Turn:
     weakness_count: int | None = None
     retried: bool = False
     usage_estimated: bool = False  # usage guessed from text length (turn was cut off)
+    score: float | None = None  # critic's "Điểm: X/10"
+    abandoned: bool = False  # unfinished turn left behind when the session was resumed
     done: bool = False
 
     @property
     def title(self) -> str:
         if self.role == "synthesizer":
             return f"Kết quả cuối — {self.speaker} ({self.model})"
-        return f"Vòng {self.round} · {ROLE_LABELS[self.role]} — {self.speaker} ({self.model})"
+        title = f"Vòng {self.round} · {ROLE_LABELS[self.role]} — {self.speaker} ({self.model})"
+        if self.score is not None:
+            title += f" · {self.score:g}/10"
+        return title
 
 
 class Debate:
@@ -142,7 +173,50 @@ class Debate:
         self.started_at = datetime.now()
         self.finished_at: datetime | None = None
         self.budget_hit = False
+        self.early_stopped = False
+        self.resumed = 0
         self._current_prompt = ""
+        self._log_stem: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, clients: dict[str, LLMClient], log_stem: str | None = None
+    ) -> Debate:
+        """Rebuild a session from its saved JSON log (see `to_dict`)."""
+        known = {f.name for f in fields(DebateConfig)}
+        config = DebateConfig(**{k: v for k, v in data["config"].items() if k in known})
+        debate = cls(config, clients)
+        debate.started_at = datetime.fromisoformat(data["started_at"])
+        if data.get("finished_at"):
+            debate.finished_at = datetime.fromisoformat(data["finished_at"])
+        debate.status = data.get("status", "stopped")
+        debate.error = data.get("error")
+        debate.budget_hit = bool(data.get("budget_hit"))
+        debate.early_stopped = bool(data.get("early_stopped"))
+        debate.resumed = int(data.get("resumed", 0))
+        turn_fields = {f.name for f in fields(Turn)} - {"usage"}
+        for raw in data.get("turns", []):
+            turn = Turn(**{k: v for k, v in raw.items() if k in turn_fields})
+            turn.usage = Usage(**raw.get("usage", {}))
+            debate.turns.append(turn)
+        debate._log_stem = log_stem
+        return debate
+
+    @property
+    def can_resume(self) -> bool:
+        return self.status in ("stopped", "error") and self.final_text is None
+
+    def prepare_resume(self) -> None:
+        """Keep finished turns, set aside the cut-off one, and get ready to `run()` again."""
+        if not self.can_resume:
+            raise ValueError("Chỉ tiếp tục được phiên đã dừng hoặc bị lỗi, chưa có kết quả cuối.")
+        for turn in self.turns:
+            if not turn.done:
+                turn.abandoned = True
+        self.status = "pending"
+        self.error = None
+        self.finished_at = None
+        self.resumed += 1
 
     # ---- results -------------------------------------------------------
     @property
@@ -173,6 +247,10 @@ class Debate:
     def total_cost(self) -> float | None:
         values = list(self.cost_by_provider.values())
         return None if None in values else sum(values)
+
+    @property
+    def scores(self) -> list[tuple[int, float]]:
+        return [(t.round, t.score) for t in self.turns if t.done and t.score is not None]
 
     @property
     def final_text(self) -> str | None:
@@ -214,6 +292,15 @@ class Debate:
             f"# Việc của bạn lúc này\n{instruction}"
         )
 
+    def _system(self, role: str) -> str:
+        cfg = self.config
+        base = {"proposer": PROPOSER_SYSTEM, "critic": CRITIC_SYSTEM, "synthesizer": SYNTH_SYSTEM}
+        parts = [base[role], LANGUAGE_RULES[cfg.language]]
+        persona = {"proposer": cfg.proposer_persona, "critic": cfg.critic_persona}.get(role)
+        if persona:
+            parts.append(f"Vai chuyên môn của bạn: {persona}. Vẫn giữ nguyên mọi quy tắc ở trên.")
+        return "\n".join(parts)
+
     # ---- engine --------------------------------------------------------
     def _schedule(self) -> list[tuple[int, str, str]]:
         cfg = self.config
@@ -226,15 +313,15 @@ class Debate:
 
     def run(self, should_stop: Callable[[], bool] = lambda: False) -> Iterator[tuple]:
         self.status = "running"
-        systems = {
-            "proposer": PROPOSER_SYSTEM,
-            "critic": CRITIC_SYSTEM,
-            "synthesizer": SYNTH_SYSTEM,
-        }
+        # On a resumed session, finished turns are replayed from the log, not re-run.
+        finished = [(t.round, t.role) for t in self.turns if t.done]
         try:
             for round_no, role, speaker in self._schedule():
-                if self.budget_hit and role != "synthesizer":
-                    continue  # over budget: skip the remaining rounds, go to synthesis
+                if (self.budget_hit or self.early_stopped) and role != "synthesizer":
+                    continue  # over budget or good enough: skip remaining rounds, synthesize
+                if finished and finished[0] == (round_no, role):
+                    finished.pop(0)
+                    continue
                 client = self.clients[speaker]
                 turn = Turn(round=round_no, role=role, speaker=speaker, model=client.model)
                 prompt = self._prompt(role, round_no)
@@ -252,7 +339,7 @@ class Debate:
                             f"\n\nLƯU Ý: lượt trước của bạn chưa nêu đủ {MIN_WEAKNESSES} điểm yếu "
                             "cụ thể dưới mục '## Điểm yếu'. Làm lại đúng quy tắc."
                         )
-                    for chunk in client.stream(systems[role], prompt, self.config.max_tokens):
+                    for chunk in client.stream(self._system(role), prompt, self.config.max_tokens):
                         if should_stop():
                             self._estimate_partial(turn, prompt)
                             self._finish("stopped")
@@ -267,6 +354,11 @@ class Debate:
                     if turn.weakness_count >= MIN_WEAKNESSES:
                         break
                 turn.done = True
+                if role == "critic":
+                    turn.score = parse_score(turn.text)
+                    stop_at = self.config.stop_score
+                    if stop_at and turn.score is not None and turn.score >= stop_at:
+                        self.early_stopped = round_no < self.config.rounds
                 if role != "synthesizer" and self.total_usage.total >= self.config.token_budget:
                     self.budget_hit = True
                 yield ("turn_end", turn)
@@ -325,6 +417,9 @@ class Debate:
             "usage": {p: asdict(u) for p, u in self.usage_by_provider.items()},
             "cost_usd": self.cost_by_provider,
             "budget_hit": self.budget_hit,
+            "early_stopped": self.early_stopped,
+            "resumed": self.resumed,
+            "scores": [{"round": r, "score": sc} for r, sc in self.scores],
             "turns": [asdict(t) for t in self.turns],
             "final": self.final_text,
         }
@@ -348,7 +443,15 @@ class Debate:
             f"- Trạng thái: {self.status}" + (f" — {self.error}" if self.error else ""),
             f"- Số vòng: {cfg.rounds} · max_tokens/lượt: {cfg.max_tokens}",
             f"- Đề xuất: {cfg.proposer} · Phản biện: {cfg.critic} · Tổng hợp: {cfg.synthesizer}",
+            f"- Ngôn ngữ: {LANGUAGES[cfg.language]}",
         ]
+        if cfg.proposer_persona or cfg.critic_persona:
+            lines.append(
+                f"- Vai chuyên môn: đề xuất = {cfg.proposer_persona or '—'} · "
+                f"phản biện = {cfg.critic_persona or '—'}"
+            )
+        if self.scores:
+            lines.append("- Điểm phản biện: " + ", ".join(f"V{r}: {s:g}" for r, s in self.scores))
         costs = self.cost_by_provider
         for provider, u in self.usage_by_provider.items():
             lines.append(
@@ -358,9 +461,17 @@ class Debate:
         lines.append(f"- Chi phí ước tính: {format_usd(self.total_cost)}")
         if self.budget_hit:
             lines.append(f"- Chạm ngân sách {cfg.token_budget:,} token → bỏ các vòng còn lại")
+        if self.early_stopped:
+            lines.append(f"- Điểm đạt ngưỡng {cfg.stop_score}/10 → dừng sớm, chuyển sang tổng hợp")
+        if self.resumed:
+            lines.append(f"- Đã tiếp tục phiên {self.resumed} lần")
         lines += ["", "## Task", "", cfg.task, ""]
         for turn in self.turns:
-            note = "" if turn.done else " _(chưa xong)_"
+            note = (
+                " _(bỏ dở, đã chạy lại khi tiếp tục phiên)_"
+                if turn.abandoned
+                else ("" if turn.done else " _(chưa xong)_")
+            )
             lines += [f"## {turn.title}{note}", "", turn.text.strip(), ""]
         return "\n".join(lines)
 
@@ -420,6 +531,8 @@ def list_logs(logs_dir: str | Path = "logs") -> list[dict]:
                         u.get("input_tokens", 0) + u.get("output_tokens", 0) for u in usage.values()
                     ),
                     "cost": None if not costs or None in costs else sum(costs),
+                    "resumable": data.get("status") in ("stopped", "error")
+                    and not data.get("final"),
                 }
             )
         except (OSError, ValueError, AttributeError):

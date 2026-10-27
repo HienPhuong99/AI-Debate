@@ -27,6 +27,9 @@ Mở http://localhost:8501. Chưa có key thì bật **Chế độ demo (mock)**
 - Phản biện nêu chưa đủ 2 điểm yếu thì app tự yêu cầu làm lại một lần.
 - Ước tính chi phí USD theo bảng giá chính thức; ngân sách token cả phiên (vượt thì chuyển thẳng sang tổng hợp).
 - Tab **Lịch sử** xem lại và tải các phiên đã lưu; có task mẫu để thử nhanh.
+- Bên phản biện chấm điểm đề xuất mỗi vòng (biểu đồ); tuỳ chọn dừng sớm khi điểm đạt ngưỡng.
+- Chọn ngôn ngữ trả lời và vai chuyên môn (persona) cho từng bên.
+- **Tiếp tục phiên** đã dừng hoặc bị lỗi (ngay trên màn hình hoặc từ tab Lịch sử) mà không chạy lại các lượt đã xong.
 
 ## Cấu trúc
 

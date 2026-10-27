@@ -104,7 +104,7 @@ def test_critic_gets_anti_agreement_prompt():
     claude = ScriptedClient("Claude", [])
     gemini = ScriptedClient("Gemini", [GOOD_CRITIQUE])
     run_all(Debate(DebateConfig(task="x", rounds=1), {"Claude": claude, "Gemini": gemini}))
-    assert gemini.calls[0]["system"] == CRITIC_SYSTEM
+    assert gemini.calls[0]["system"].startswith(CRITIC_SYSTEM)
     assert "ÍT NHẤT 2" in CRITIC_SYSTEM
 
 

@@ -11,12 +11,14 @@ from core.base import Usage
 
 def _canned_reply(system: str, prompt: str) -> str:
     if "PHẢN BIỆN" in system:
+        # Score rises each round (5, 7, 9...) so demo mode can show early stopping.
         return (
             "## Điểm yếu\n"
             "1. Đề xuất chưa nêu rõ tiêu chí đo lường thành công.\n"
             "2. Chưa xét rủi ro khi giả định ban đầu sai.\n"
             "3. Thiếu ước lượng chi phí và thời gian.\n\n"
-            "## Gợi ý sửa\n- Thêm chỉ số cụ thể và phương án dự phòng."
+            "## Gợi ý sửa\n- Thêm chỉ số cụ thể và phương án dự phòng.\n\n"
+            f"Điểm: {min(10, 5 + 2 * prompt.count('— Phản biện ('))}/10"
         )
     if "TỔNG HỢP" in system:
         return (

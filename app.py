@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 
+import altair as alt
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -18,6 +19,8 @@ from core.debate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_ROUNDS,
     DEFAULT_TOKEN_BUDGET,
+    LANGUAGES,
+    MAX_PERSONA_CHARS,
     MAX_ROUNDS,
     MAX_TOKEN_BUDGET,
     MAX_TOKENS_CAP,
@@ -40,6 +43,7 @@ LOGS_DIR = APP_DIR / "logs"
 load_dotenv(APP_DIR / ".env")
 
 AVATARS = {"Claude": "🟠", "Gemini": "🔵"}
+SCORE_COLOR = "#c4613f"  # passes the dataviz validator on the light surface
 EXAMPLE_TASKS = [
     "Lập kế hoạch 4 tuần học Python cho người mới, mỗi ngày 1 giờ.",
     "Thiết kế quy trình onboarding 2 tuần cho nhân viên mới ở công ty 20 người.",
@@ -89,6 +93,54 @@ def build_clients(mock: bool) -> dict:
     return clients
 
 
+def clients_for_models(models: dict[str, str]) -> dict:
+    """Clients for a saved session's models; 'mock:' models stay in demo mode."""
+    load_dotenv(APP_DIR / ".env", override=True)  # pick up a key fixed after an error
+    if all(m.startswith("mock:") for m in models.values()):
+        return {p: MockClient(p, m) for p, m in models.items()}
+    clients, errors = {}, []
+    for name, factory in (("Claude", ClaudeClient), ("Gemini", GeminiClient)):
+        try:
+            clients[name] = factory(model=models[name].removeprefix("mock:"))
+        except LLMError as e:
+            errors.append(str(e))
+    if errors:
+        raise LLMError(" ".join(errors))
+    return clients
+
+
+def start(debate: Debate) -> None:
+    ss.debate = debate
+    ss.saved_paths = None
+    ss.stop_requested = False
+    ss.running = True
+
+
+def on_resume() -> None:
+    debate = ss.debate
+    ss.form_error = None
+    try:
+        debate.clients = clients_for_models({p: c.model for p, c in debate.clients.items()})
+        debate.prepare_resume()
+    except (ValueError, LLMError) as e:
+        ss.form_error = str(e)
+        return
+    start(debate)
+
+
+def on_resume_from_log(json_path: Path) -> None:
+    ss.form_error = None
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        debate = Debate.from_dict(data, clients_for_models(data["models"]), json_path.stem)
+        debate.prepare_resume()
+    except (OSError, KeyError, ValueError, LLMError) as e:
+        ss.form_error = f"Không tiếp tục được phiên: {e}"
+        return
+    ss.task = debate.config.task
+    start(debate)
+
+
 def on_run() -> None:
     ss.form_error = None
     try:
@@ -99,15 +151,16 @@ def on_run() -> None:
             proposer=ss.proposer,
             synthesizer=ss.synthesizer,
             token_budget=ss.token_budget,
+            language=ss.language,
+            proposer_persona=ss.proposer_persona,
+            critic_persona=ss.critic_persona,
+            stop_score=ss.stop_score,
         )
         clients = build_clients(ss.mock)
     except (ValueError, LLMError) as e:
         ss.form_error = str(e)
         return
-    ss.debate = Debate(config, clients)
-    ss.saved_paths = None
-    ss.stop_requested = False
-    ss.running = True
+    start(Debate(config, clients))
 
 
 def on_stop() -> None:
@@ -161,6 +214,34 @@ def render_metrics(target, debate: Debate | None) -> None:
         )
 
 
+def render_scores(target, debate: Debate | None) -> None:
+    scores = debate.scores if debate else []
+    if not scores:
+        target.empty()
+        return
+    rows = [{"Vòng": r, "Điểm": sc} for r, sc in scores]
+    chart = (
+        alt.Chart(alt.Data(values=rows))
+        .mark_line(
+            color=SCORE_COLOR,
+            strokeWidth=2,
+            point=alt.OverlayMarkDef(color=SCORE_COLOR, size=80, filled=True),
+        )
+        .encode(
+            x=alt.X("Vòng:O", axis=alt.Axis(labelAngle=0)),
+            y=alt.Y(
+                "Điểm:Q", scale=alt.Scale(domain=[0, 10]), axis=alt.Axis(values=[0, 2, 4, 6, 8, 10])
+            ),
+            tooltip=[alt.Tooltip("Vòng:O"), alt.Tooltip("Điểm:Q", format="g")],
+        )
+        .properties(height=180)
+    )
+    with target.container():
+        st.markdown("**Điểm bên phản biện chấm cho đề xuất (0–10)**")
+        st.altair_chart(chart, width="stretch")
+        st.caption(" · ".join(f"Vòng {r}: {sc:g}/10" for r, sc in scores))
+
+
 def turn_notes(turn: Turn) -> list[str]:
     notes = []
     if turn.truncated:
@@ -172,7 +253,9 @@ def turn_notes(turn: Turn) -> list[str]:
             notes.append(f"⚠️ Chỉ nêu {turn.weakness_count} điểm yếu (yêu cầu ≥ {MIN_WEAKNESSES}).")
     if turn.usage_estimated:
         notes.append("≈ Token của lượt này là ước tính (bị dừng trước khi API báo số thật).")
-    if not turn.done:
+    if turn.abandoned:
+        notes.append("↻ Lượt bỏ dở này đã được chạy lại khi tiếp tục phiên.")
+    elif not turn.done:
         notes.append("⏹ Lượt này chưa xong.")
     return notes
 
@@ -196,7 +279,7 @@ def show_turn_body(turn: Turn, body, notes) -> None:
         notes.empty()
 
 
-def run_live(debate: Debate, conv, final_box, metrics) -> None:
+def run_live(debate: Debate, conv, final_box, metrics, scores) -> None:
     slots = {}
     events = debate.run(should_stop=lambda: ss.stop_requested)
     try:
@@ -213,6 +296,7 @@ def run_live(debate: Debate, conv, final_box, metrics) -> None:
             elif kind == "turn_end":
                 show_turn_body(turn, body, notes)
                 render_metrics(metrics, debate)
+                render_scores(scores, debate)
     finally:
         # "Dừng" interrupts this script mid-loop; close the engine now (not at some later GC)
         # so a turn cut off between chunks is marked stopped and its tokens estimated.
@@ -305,6 +389,39 @@ with st.sidebar:
         disabled=locked,
         help="Vượt ngân sách thì bỏ các vòng còn lại và chuyển thẳng sang tổng hợp.",
     )
+    st.selectbox(
+        "Dừng sớm khi điểm phản biện ≥",
+        [0, 7, 8, 9, 10],
+        index=0,
+        format_func=lambda v: "Tắt" if v == 0 else f"{v}/10",
+        key="stop_score",
+        disabled=locked,
+        help="Bên phản biện chấm đề xuất mỗi vòng. Đạt ngưỡng thì bỏ các vòng còn lại "
+        "và chuyển sang tổng hợp để tiết kiệm token.",
+    )
+    st.selectbox(
+        "Ngôn ngữ trả lời",
+        list(LANGUAGES),
+        format_func=LANGUAGES.get,
+        key="language",
+        disabled=locked,
+    )
+    with st.expander("Vai chuyên môn (tuỳ chọn)"):
+        st.text_input(
+            "Bên đề xuất đóng vai",
+            key="proposer_persona",
+            max_chars=MAX_PERSONA_CHARS,
+            placeholder="vd: kiến trúc sư phần mềm 10 năm kinh nghiệm",
+            disabled=locked,
+        )
+        st.text_input(
+            "Bên phản biện đóng vai",
+            key="critic_persona",
+            max_chars=MAX_PERSONA_CHARS,
+            placeholder="vd: kỹ sư bảo mật khó tính",
+            disabled=locked,
+        )
+        st.caption("Vai chỉ thêm góc nhìn; quy tắc phản biện ≥ 2 điểm yếu vẫn giữ nguyên.")
     st.toggle(
         "Chế độ demo (mock, không gọi API)",
         value=os.getenv("AI_DEBATE_MOCK") == "1",
@@ -342,7 +459,15 @@ def render_history() -> None:
     choice = st.selectbox("Chọn phiên", range(len(sessions)), format_func=label, key="history_pick")
     item = sessions[choice]
     md = item["md"].read_text(encoding="utf-8") if item["md"].exists() else "(thiếu file .md)"
-    c1, c2, _ = st.columns([1, 1, 2])
+    c1, c2, c3 = st.columns([1, 1, 2])
+    if item["resumable"]:
+        c3.button(
+            "↻ Tiếp tục phiên này",
+            on_click=on_resume_from_log,
+            args=(item["json"],),
+            key="history_resume",
+            help="Giữ các lượt đã xong, chạy tiếp từ lượt bị dừng/lỗi. Mở tab Phiên hiện tại để xem.",
+        )
     c1.download_button(
         "⬇️ Tải .md",
         data=md,
@@ -369,7 +494,9 @@ def render_history() -> None:
 # History is drawn first: a live run below blocks the script until it finishes.
 with tab_history:
     if ss.running:
-        st.info("Đang chạy một phiên — xem lịch sử sau khi xong.")
+        st.info(
+            "Đang chạy một phiên — mở tab **Phiên hiện tại** để xem; lịch sử hiện lại sau khi xong."
+        )
     else:
         render_history()
 
@@ -398,6 +525,7 @@ with tab_run:
 
     status_box = st.container()
     metrics = st.empty()
+    scores = st.empty()
     st.subheader("Hội thoại")
     conv = st.container()
     st.subheader("Kết quả cuối")
@@ -405,11 +533,14 @@ with tab_run:
 
 debate: Debate | None = ss.debate
 render_metrics(metrics, debate)
+render_scores(scores, debate)
 
 if debate is None:
     conv.info("Nhập task rồi bấm **Chạy** để bắt đầu.")
 elif ss.running and debate.status == "pending":
-    run_live(debate, conv, final_box, metrics)
+    for turn in debate.turns:  # a resumed session shows its earlier turns first
+        show_turn_body(turn, *open_turn(turn, conv))
+    run_live(debate, conv, final_box, metrics, scores)
     ss.running = False
     save_once(debate)
     st.rerun()
@@ -428,12 +559,24 @@ else:
             st.warning("Đã dừng theo yêu cầu. Phần hội thoại đã có vẫn được lưu.")
         elif debate.status == "error":
             st.error(f"Lỗi khi gọi API: {debate.error}")
+        if debate.can_resume:
+            st.button(
+                "↻ Tiếp tục phiên",
+                on_click=on_resume,
+                help="Giữ các lượt đã xong, chạy tiếp từ lượt bị dừng/lỗi "
+                "(sửa key trong .env trước nếu lỗi do key).",
+            )
         elif debate.status == "done":
             st.success("Hoàn tất.")
         if debate.budget_hit:
             st.info(
                 f"Đã chạm ngân sách {debate.config.token_budget:,} token nên bỏ các vòng còn lại "
                 "và chuyển thẳng sang tổng hợp."
+            )
+        if debate.early_stopped:
+            st.info(
+                f"Điểm phản biện đạt ngưỡng {debate.config.stop_score}/10 nên dừng sớm "
+                "và chuyển sang tổng hợp."
             )
         if ss.saved_paths:
             names = ", ".join(p.name for p in ss.saved_paths)

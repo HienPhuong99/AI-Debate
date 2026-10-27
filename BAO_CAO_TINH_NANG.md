@@ -41,3 +41,45 @@ Ngày: 2026-10-27 · Nhánh: `claude/ai-debate-app` (PR #1)
 - Giá đúng cho tài khoản của bạn: tier miễn phí, giảm giá hay batch không được tính.
 - Mức sai lệch của ước tính ~4 ký tự/token với tiếng Việt: thường **thấp hơn** thực tế, vì tiếng Việt tốn nhiều token hơn.
 - Các mục trong `BAO_CAO.md` §3 vẫn còn nguyên.
+
+---
+
+# Đợt 3 — tham khảo repo tương tự (2026-10-27)
+
+## 1. Nguồn tham khảo
+
+| Dự án | Ý tưởng lấy được |
+|---|---|
+| [Turncoat](https://discuss.streamlit.io/t/ai-models-debate-turncoat-style/120750) (Streamlit, 2 model tranh luận) | Kiểu UI chọn chủ đề/model ở sidebar — app đã có; không lấy phần đổi phe/giọng đọc |
+| [MALLM](https://github.com/Multi-Agent-LLMs/mallm) (framework multi-agent) | Giám khảo chấm điểm (`judge`), **persona** cho agent, giới hạn vòng |
+| [Du et al. — llm_multiagent_debate](https://github.com/composable-models/llm_multiagent_debate) | Sửa câu trả lời qua từng vòng sau khi xem phản hồi — đúng mô hình app đang dùng |
+| Paper *Sequential Consensus for Multi-Agent LLM Debates* ([arXiv 2605.19193](https://arxiv.org/pdf/2605.19193)) | Chấm điểm sau mỗi vòng và **dừng sớm** khi đạt ngưỡng để tiết kiệm chi phí |
+| [verd](https://pypi.org/project/verd/), [GPT Engage](https://awesome.ecosyste.ms/projects/github.com%2Frahulrajaram%2Fgptengage) (CLI nhiều provider) | Gợi ý cho đợt sau: thêm provider thứ 3 (xem mục 4) |
+
+Mình chỉ đọc README và mô tả, không sao chép code của dự án nào.
+
+## 2. Đã làm
+
+| Tính năng | Chi tiết |
+|---|---|
+| **Chấm điểm mỗi vòng** | Bên phản biện bắt buộc kết thúc bằng `Điểm: X/10`. Điểm hiện ở tiêu đề lượt, trên biểu đồ đường (có tooltip, có dòng chữ liệt kê điểm thay bảng) và trong log (`scores`). Không cần gọi thêm API. Điểm cao **không** miễn quy tắc nêu ≥ 2 điểm yếu. |
+| **Dừng sớm theo điểm** | Tuỳ chọn ngưỡng 7–10 (mặc định Tắt). Khi đạt ngưỡng, app bỏ các vòng còn lại và chuyển sang tổng hợp. Chế độ demo cho điểm tăng 5 → 7 → 9 để thử được tính năng này. |
+| **Ngôn ngữ trả lời** | Theo ngôn ngữ của task / Tiếng Việt / English, áp dụng cho cả 3 vai. |
+| **Vai chuyên môn (persona)** | Mỗi bên tối đa 200 ký tự, chỉ gắn vào prompt của đúng vai đó. Các quy tắc gốc giữ nguyên, persona được nối thêm phía sau. |
+| **Tiếp tục phiên** | Áp dụng cho phiên đã dừng hoặc bị lỗi và chưa có kết quả cuối. Các lượt đã xong được giữ lại; lượt dở được đánh dấu "bỏ dở" (token của nó vẫn được tính) rồi chạy lại. Log của chính phiên đó được ghi đè, không tạo file mới. Trước khi tiếp tục, app đọc lại `.env`, nên sửa key xong là tiếp tục được ngay. Có thể tiếp tục từ màn hình hiện tại hoặc từ tab Lịch sử. Log cũ, thiếu các trường mới, vẫn đọc được. |
+
+## 3. Kết quả test
+
+- **pytest: 67/67 PASS** (21 test mới trong `tests/test_round3.py`); `ruff check` sạch.
+- **Playwright (mock)**:
+  - Vòng 1: 17/18. Kịch bản hỏng là do selector của script test trùng với tooltip trợ giúp, không phải lỗi của app.
+  - Vòng 2: **18/18 PASS**. Gồm 12 kịch bản cũ và 4 kịch bản mới: dừng sớm + biểu đồ, Dừng → Tiếp tục, tiếp tục từ Lịch sử, ngôn ngữ + persona lưu vào log.
+- **Chưa kiểm chứng với API thật**:
+  - Model thật có luôn ghi đúng dòng `Điểm: X/10` không. Nếu thiếu, lượt đó không có điểm và không kích hoạt dừng sớm.
+  - Persona và ngôn ngữ có thực sự đổi văn phong không. Chế độ demo bỏ qua hai tuỳ chọn này.
+
+## 4. Đề xuất cho đợt sau (chưa làm)
+
+- Provider thứ 3 (OpenAI hoặc OpenRouter) — cần thêm SDK và key, nên để bạn quyết định.
+- Bước "đề xuất độc lập": cả hai bên cùng trả lời vòng 1 rồi mới phản biện chéo (theo Du et al.). Cách này tốn gấp đôi token ở vòng 1.
+- Giám khảo độc lập là một model thứ ba thay vì để bên phản biện tự chấm. Hiện bên phản biện vừa bắt lỗi vừa chấm, nên điểm có thể bị thiên lệch.
