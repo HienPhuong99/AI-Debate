@@ -40,6 +40,8 @@ core/gemini_client.py  # SDK google-genai (streaming)
 core/debate.py         # engine tranh luận, prompt, giới hạn, lưu log
 core/mock_client.py    # client giả cho chế độ demo / test
 core/pricing.py        # bảng giá model, ước tính chi phí
+ui_theme.py            # CSS giao diện (theo skill apple-design)
+.claude/skills/        # skill apple-design (nguồn: emilkowalski/skills, MIT)
 tests/                 # pytest
 ```
 

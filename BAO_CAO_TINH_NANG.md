@@ -83,3 +83,28 @@ Mình chỉ đọc README và mô tả, không sao chép code của dự án nà
 - Provider thứ 3 (OpenAI hoặc OpenRouter) — cần thêm SDK và key, nên để bạn quyết định.
 - Bước "đề xuất độc lập": cả hai bên cùng trả lời vòng 1 rồi mới phản biện chéo (theo Du et al.). Cách này tốn gấp đôi token ở vòng 1.
 - Giám khảo độc lập là một model thứ ba thay vì để bên phản biện tự chấm. Hiện bên phản biện vừa bắt lỗi vừa chấm, nên điểm có thể bị thiên lệch.
+
+---
+
+# Đợt 4 — giao diện theo skill `apple-design`
+
+**Cài skill:** [emilkowalski/skills › apple-design](https://github.com/emilkowalski/skills/tree/main/skills/apple-design), commit `2d22863`, license MIT.
+- **Kiểm tra trước khi cài:** chỉ có 1 file `SKILL.md`, là hướng dẫn thiết kế bằng văn bản. Không có script, không có lệnh chạy, không đọc file hay gọi mạng, không chứa credential.
+- **Vị trí cài:** `.claude/skills/apple-design/`, kèm `SOURCE.md` (nguồn + commit) và `LICENSE`. Claude Code sẽ tự nạp skill này ở phiên sau khi mở dự án.
+
+**Áp dụng vào app:**
+
+| Nguyên tắc trong skill | Thay đổi |
+|---|---|
+| Typography: font hệ thống, tracking theo cỡ chữ | Dùng font hệ thống (SF Pro / Segoe UI). Tiêu đề lớn có tracking âm (−0.025em) và leading chặt; nhãn nhóm viết hoa nhỏ, tracking dương |
+| Light/dark chỉnh riêng (Craft) | Theme `[theme.light]` và `[theme.dark]` riêng, màu nhấn đất nung. Màu biểu đồ đổi theo chế độ, cả hai qua validator dataviz |
+| Vật liệu trong suốt | Header mờ kính (`backdrop-filter`), nội dung cuộn bên dưới |
+| Bề mặt lớn trông dày hơn | Lượt hội thoại là thẻ bóng nhẹ; kết quả cuối là thẻ bóng sâu nhất, không lồng thẻ trong thẻ |
+| Phản hồi tức thì khi nhấn | Nút co lại `scale(0.97)` trong 100ms ngay lúc nhấn |
+| Simplicity, không phải minimalism | Sidebar chia 3 nhóm (Mô hình & vai trò · Độ dài & chi phí · Nâng cao); tuỳ chọn ít dùng gom vào "Nâng cao". Trang trống chỉ còn hướng dẫn 3 bước, ẩn ô token và khung kết quả rỗng; ẩn nút Deploy |
+| Nhãn cụ thể, không lặp lại | Badge vai trò (Đề xuất / Phản biện / Tổng hợp) + "Vòng N · **Bên** (model) · điểm". Bỏ việc lặp tên vai |
+| Accessibility | Có fallback cho `prefers-reduced-motion` (bỏ hiệu ứng co nút), `prefers-reduced-transparency` (header đặc), `prefers-contrast: more` (viền rõ, bỏ bóng) |
+
+**Không áp dụng:** spring, kéo-thả, momentum, haptics. App không có tương tác cử chỉ, Streamlit cũng không hỗ trợ; thêm vào chỉ là trang trí, trái với nguyên tắc "Purpose" của chính skill.
+
+**Test:** pytest 67/67; Playwright 18/18 (chạy lại toàn bộ); đã chụp và soát giao diện ở cả chế độ sáng lẫn tối.

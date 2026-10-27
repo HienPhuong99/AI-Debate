@@ -37,13 +37,18 @@ from core.debate import (
 )
 from core.gemini_client import DEFAULT_GEMINI_MODEL, GEMINI_MODELS, GeminiClient
 from core.mock_client import MockClient
+from ui_theme import SCORE_COLORS, page_css
 
 APP_DIR = Path(__file__).parent
 LOGS_DIR = APP_DIR / "logs"
 load_dotenv(APP_DIR / ".env")
 
 AVATARS = {"Claude": "🟠", "Gemini": "🔵"}
-SCORE_COLOR = "#c4613f"  # passes the dataviz validator on the light surface
+ROLE_BADGES = {
+    "proposer": ":orange-badge[Đề xuất]",
+    "critic": ":violet-badge[Phản biện]",
+    "synthesizer": ":green-badge[Tổng hợp]",
+}
 EXAMPLE_TASKS = [
     "Lập kế hoạch 4 tuần học Python cho người mới, mỗi ngày 1 giờ.",
     "Thiết kế quy trình onboarding 2 tuần cho nhân viên mới ở công ty 20 người.",
@@ -53,16 +58,9 @@ EXAMPLE_TASKS = [
 STATUS_LABELS = {"done": "✅ xong", "stopped": "⏹ đã dừng", "error": "❌ lỗi", "running": "… dở"}
 
 st.set_page_config(page_title="AI Debate", page_icon="⚖️", layout="wide")
-# Model replies use Markdown headings; keep them from dwarfing the page.
-st.markdown(
-    """<style>
-    [data-testid="stChatMessage"] h1, .st-key-history_view h1 { font-size: 1.35rem; }
-    [data-testid="stChatMessage"] h2, .st-key-history_view h2 { font-size: 1.15rem; }
-    [data-testid="stChatMessage"] h3, [data-testid="stChatMessage"] h4,
-    .st-key-history_view h3, .st-key-history_view h4 { font-size: 1.0rem; }
-    </style>""",
-    unsafe_allow_html=True,
-)
+DARK = st.context.theme.type == "dark"
+SCORE_COLOR = SCORE_COLORS["dark" if DARK else "light"]
+st.markdown(page_css(DARK), unsafe_allow_html=True)
 
 ss = st.session_state
 ss.setdefault("debate", None)
@@ -234,7 +232,8 @@ def render_scores(target, debate: Debate | None) -> None:
             ),
             tooltip=[alt.Tooltip("Vòng:O"), alt.Tooltip("Điểm:Q", format="g")],
         )
-        .properties(height=180)
+        .properties(height=180, background="transparent")
+        .configure_view(strokeWidth=0)
     )
     with target.container():
         st.markdown("**Điểm bên phản biện chấm cho đề xuất (0–10)**")
@@ -260,11 +259,21 @@ def turn_notes(turn: Turn) -> list[str]:
     return notes
 
 
+def ui_title(turn: Turn) -> str:
+    """Badge already names the role, so the heading only adds round, speaker and score."""
+    parts = [] if turn.role == "synthesizer" else [f"Vòng {turn.round}"]
+    parts.append(f"**{turn.speaker}**")
+    title = " · ".join(parts) + f" :gray[({turn.model})]"
+    if turn.score is not None:
+        title += f" · **{turn.score:g}/10**"
+    return title
+
+
 def open_turn(turn: Turn, box):
     """Draw the turn header inside `box` and return a placeholder for its body."""
     with box:
         message = st.chat_message(turn.speaker, avatar=AVATARS[turn.speaker])
-        message.markdown(f"**{turn.title}**")
+        message.markdown(f"{ROLE_BADGES[turn.role]} {ui_title(turn)}")
         body = message.empty()
         notes = message.empty()
     return body, notes
@@ -337,9 +346,15 @@ def render_final(debate: Debate) -> None:
 
 
 # ---- sidebar ---------------------------------------------------------------
+def section(label: str) -> None:
+    st.markdown(f'<div class="ad-section">{label}</div>', unsafe_allow_html=True)
+
+
 with st.sidebar:
     st.header("Cấu hình")
     locked = ss.running
+
+    section("Mô hình & vai trò")
     st.selectbox(
         "Model Claude",
         CLAUDE_MODELS,
@@ -368,6 +383,8 @@ with st.sidebar:
         horizontal=True,
         disabled=locked,
     )
+
+    section("Độ dài & chi phí")
     st.slider("Số vòng", MIN_ROUNDS, MAX_ROUNDS, DEFAULT_ROUNDS, key="rounds", disabled=locked)
     st.slider(
         "max_tokens mỗi lượt",
@@ -399,14 +416,20 @@ with st.sidebar:
         help="Bên phản biện chấm đề xuất mỗi vòng. Đạt ngưỡng thì bỏ các vòng còn lại "
         "và chuyển sang tổng hợp để tiết kiệm token.",
     )
-    st.selectbox(
-        "Ngôn ngữ trả lời",
-        list(LANGUAGES),
-        format_func=LANGUAGES.get,
-        key="language",
-        disabled=locked,
+    st.caption(
+        f"Mỗi phiên gồm {2 * ss.rounds + 1} lượt gọi model "
+        f"(tối đa ~{(2 * ss.rounds + 1) * ss.max_tokens:,} token output)."
     )
-    with st.expander("Vai chuyên môn (tuỳ chọn)"):
+
+    section("Nâng cao")
+    with st.expander("Ngôn ngữ & vai chuyên môn"):
+        st.selectbox(
+            "Ngôn ngữ trả lời",
+            list(LANGUAGES),
+            format_func=LANGUAGES.get,
+            key="language",
+            disabled=locked,
+        )
         st.text_input(
             "Bên đề xuất đóng vai",
             key="proposer_persona",
@@ -427,16 +450,15 @@ with st.sidebar:
         value=os.getenv("AI_DEBATE_MOCK") == "1",
         key="mock",
         disabled=locked,
-    )
-    st.caption(
-        f"Mỗi phiên gồm {2 * ss.rounds + 1} lượt gọi model "
-        f"(tối đa ~{(2 * ss.rounds + 1) * ss.max_tokens:,} token output)."
+        help="Chạy thử toàn bộ luồng bằng câu trả lời mẫu, không cần key, không tốn tiền.",
     )
 
 # ---- main ------------------------------------------------------------------
 st.title("⚖️ AI Debate")
-st.caption(
-    "Claude và Gemini thảo luận task của bạn: một bên đề xuất, một bên phản biện, rồi tổng hợp."
+st.markdown(
+    '<p class="ad-subtitle">Claude và Gemini thảo luận task của bạn: một bên đề xuất, '
+    "một bên phản biện, rồi tổng hợp thành kết quả cuối.</p>",
+    unsafe_allow_html=True,
 )
 
 tab_run, tab_history = st.tabs(["Phiên hiện tại", "Lịch sử"])
@@ -524,19 +546,30 @@ with tab_run:
         st.error(ss.form_error)
 
     status_box = st.container()
-    metrics = st.empty()
-    scores = st.empty()
+    metrics = scores = final_box = None
+    if ss.debate is not None:  # nothing to measure yet: keep the empty page simple
+        with st.container(key="metrics_box"):
+            metrics = st.empty()
+            scores = st.empty()
     st.subheader("Hội thoại")
     conv = st.container()
-    st.subheader("Kết quả cuối")
-    final_box = st.container(border=True)
+    if ss.debate is not None:
+        st.subheader("Kết quả cuối")
+        final_box = st.container(border=True, key="final_box")
 
 debate: Debate | None = ss.debate
-render_metrics(metrics, debate)
-render_scores(scores, debate)
+if debate is not None:
+    render_metrics(metrics, debate)
+    render_scores(scores, debate)
 
 if debate is None:
-    conv.info("Nhập task rồi bấm **Chạy** để bắt đầu.")
+    with conv.container(key="empty_state"):
+        st.markdown(
+            "**Bắt đầu trong 3 bước**\n\n"
+            "1. Nhập task hoặc chọn một **task mẫu**.\n"
+            "2. Chọn model và số vòng ở thanh bên — chưa có key thì bật **Chế độ demo**.\n"
+            "3. Bấm **▶ Chạy** và xem hai bên thảo luận trực tiếp; bấm **⏹ Dừng** bất cứ lúc nào."
+        )
 elif ss.running and debate.status == "pending":
     for turn in debate.turns:  # a resumed session shows its earlier turns first
         show_turn_body(turn, *open_turn(turn, conv))
