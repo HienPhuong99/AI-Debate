@@ -1,0 +1,316 @@
+"""AI Debate — Claude và Gemini thảo luận một task rồi trả kết quả cuối.
+
+Chạy: streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import streamlit as st
+from dotenv import load_dotenv
+
+from core.base import LLMError
+from core.claude_client import CLAUDE_MODELS, DEFAULT_CLAUDE_MODEL, ClaudeClient
+from core.debate import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_ROUNDS,
+    MAX_ROUNDS,
+    MAX_TOKENS_CAP,
+    MIN_MAX_TOKENS,
+    MIN_ROUNDS,
+    MIN_WEAKNESSES,
+    Debate,
+    DebateConfig,
+    Turn,
+    save_log,
+)
+from core.gemini_client import DEFAULT_GEMINI_MODEL, GEMINI_MODELS, GeminiClient
+from core.mock_client import MockClient
+
+APP_DIR = Path(__file__).parent
+LOGS_DIR = APP_DIR / "logs"
+load_dotenv(APP_DIR / ".env")
+
+AVATARS = {"Claude": "🟠", "Gemini": "🔵"}
+
+st.set_page_config(page_title="AI Debate", page_icon="⚖️", layout="wide")
+# Model replies use Markdown headings; keep them from dwarfing the page.
+st.markdown(
+    """<style>
+    [data-testid="stChatMessage"] h1 { font-size: 1.35rem; }
+    [data-testid="stChatMessage"] h2 { font-size: 1.15rem; }
+    [data-testid="stChatMessage"] h3, [data-testid="stChatMessage"] h4 { font-size: 1.0rem; }
+    </style>""",
+    unsafe_allow_html=True,
+)
+
+ss = st.session_state
+ss.setdefault("debate", None)
+ss.setdefault("running", False)
+ss.setdefault("stop_requested", False)
+ss.setdefault("saved_paths", None)
+ss.setdefault("form_error", None)
+
+
+# ---- callbacks -------------------------------------------------------------
+def build_clients(mock: bool) -> dict:
+    if mock:
+        return {
+            "Claude": MockClient("Claude", f"mock:{ss.claude_model}"),
+            "Gemini": MockClient("Gemini", f"mock:{ss.gemini_model}"),
+        }
+    clients, errors = {}, []
+    for name, factory, model in (
+        ("Claude", ClaudeClient, ss.claude_model),
+        ("Gemini", GeminiClient, ss.gemini_model),
+    ):
+        try:
+            clients[name] = factory(model=model)
+        except LLMError as e:
+            errors.append(str(e))
+    if errors:
+        raise LLMError(" ".join(errors))
+    return clients
+
+
+def on_run() -> None:
+    ss.form_error = None
+    try:
+        config = DebateConfig(
+            task=ss.task,
+            rounds=ss.rounds,
+            max_tokens=ss.max_tokens,
+            proposer=ss.proposer,
+            synthesizer=ss.synthesizer,
+        )
+        clients = build_clients(ss.mock)
+    except (ValueError, LLMError) as e:
+        ss.form_error = str(e)
+        return
+    ss.debate = Debate(config, clients)
+    ss.saved_paths = None
+    ss.stop_requested = False
+    ss.running = True
+
+
+def on_stop() -> None:
+    # Clicking any widget interrupts the running script; this callback runs first on the rerun.
+    ss.stop_requested = True
+    ss.running = False
+    debate = ss.debate
+    if debate is not None and debate.status == "running":
+        debate._finish("stopped")
+
+
+def save_once(debate: Debate) -> None:
+    if ss.saved_paths is None and debate.status in ("done", "stopped", "error"):
+        try:
+            ss.saved_paths = save_log(debate, LOGS_DIR)
+        except OSError as e:
+            st.error(f"Không ghi được log vào {LOGS_DIR}: {e}")
+
+
+# ---- rendering -------------------------------------------------------------
+def render_metrics(target, debate: Debate | None) -> None:
+    usage = debate.usage_by_provider if debate else {}
+    with target.container():
+        cols = st.columns(3)
+        for col, provider in zip(cols, ("Claude", "Gemini"), strict=False):
+            u = usage.get(provider)
+            col.metric(
+                f"Token {provider}",
+                f"{u.total:,}" if u else "0",
+                help="Tổng input + output (gồm cả token suy nghĩ)",
+            )
+            if u:
+                col.caption(f"vào {u.input_tokens:,} · ra {u.output_tokens:,}")
+        cols[2].metric("Tổng token", f"{debate.total_usage.total:,}" if debate else "0")
+
+
+def turn_notes(turn: Turn) -> list[str]:
+    notes = []
+    if turn.truncated:
+        notes.append("⚠️ Câu trả lời bị cắt vì chạm giới hạn max_tokens.")
+    if turn.retried:
+        notes.append("↻ Phản biện lần đầu chưa đủ điểm yếu nên đã được yêu cầu làm lại.")
+    if turn.role == "critic" and turn.weakness_count is not None:
+        if turn.weakness_count < MIN_WEAKNESSES:
+            notes.append(f"⚠️ Chỉ nêu {turn.weakness_count} điểm yếu (yêu cầu ≥ {MIN_WEAKNESSES}).")
+    if not turn.done:
+        notes.append("⏹ Lượt này chưa xong.")
+    return notes
+
+
+def open_turn(turn: Turn, box):
+    """Draw the turn header inside `box` and return a placeholder for its body."""
+    with box:
+        message = st.chat_message(turn.speaker, avatar=AVATARS[turn.speaker])
+        message.markdown(f"**{turn.title}**")
+        body = message.empty()
+        notes = message.empty()
+    return body, notes
+
+
+def show_turn_body(turn: Turn, body, notes) -> None:
+    body.markdown(turn.text or "_(trống)_")
+    lines = turn_notes(turn)
+    if lines:
+        notes.caption("  \n".join(lines))
+    else:
+        notes.empty()
+
+
+def run_live(debate: Debate, conv, final_box, metrics) -> None:
+    slots = {}
+    for event in debate.run(should_stop=lambda: ss.stop_requested):
+        kind, turn = event[0], event[1]
+        if kind == "turn_start":
+            slots[id(turn)] = open_turn(turn, final_box if turn.role == "synthesizer" else conv)
+        body, notes = slots[id(turn)]
+        if kind == "chunk":
+            body.markdown(turn.text + " ▌")
+        elif kind == "turn_reset":
+            body.info("Phản biện chưa nêu đủ điểm yếu — đang yêu cầu làm lại…")
+        elif kind == "turn_end":
+            show_turn_body(turn, body, notes)
+            render_metrics(metrics, debate)
+
+
+def render_final(debate: Debate) -> None:
+    final = debate.final_text
+    if not final:
+        return
+    stamp = f"{debate.started_at:%Y%m%d-%H%M%S}"
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "⬇️ Tải kết quả cuối (.md)",
+        data=debate.final_markdown(),
+        file_name=f"ket-qua-{stamp}.md",
+        mime="text/markdown",
+        on_click="ignore",
+        type="primary",
+        width="stretch",
+    )
+    c2.download_button(
+        "⬇️ Tải toàn bộ hội thoại (.md)",
+        data=debate.to_markdown(),
+        file_name=f"hoi-thoai-{stamp}.md",
+        mime="text/markdown",
+        on_click="ignore",
+        width="stretch",
+    )
+
+
+# ---- sidebar ---------------------------------------------------------------
+with st.sidebar:
+    st.header("Cấu hình")
+    locked = ss.running
+    st.selectbox(
+        "Model Claude",
+        CLAUDE_MODELS,
+        index=CLAUDE_MODELS.index(DEFAULT_CLAUDE_MODEL),
+        key="claude_model",
+        disabled=locked,
+    )
+    st.selectbox(
+        "Model Gemini",
+        GEMINI_MODELS,
+        index=GEMINI_MODELS.index(DEFAULT_GEMINI_MODEL),
+        key="gemini_model",
+        disabled=locked,
+    )
+    st.radio(
+        "Bên đề xuất (bên kia chỉ phản biện)",
+        ["Claude", "Gemini"],
+        key="proposer",
+        horizontal=True,
+        disabled=locked,
+    )
+    st.radio(
+        "Bên tổng hợp kết quả cuối",
+        ["Claude", "Gemini"],
+        key="synthesizer",
+        horizontal=True,
+        disabled=locked,
+    )
+    st.slider("Số vòng", MIN_ROUNDS, MAX_ROUNDS, DEFAULT_ROUNDS, key="rounds", disabled=locked)
+    st.slider(
+        "max_tokens mỗi lượt",
+        MIN_MAX_TOKENS,
+        MAX_TOKENS_CAP,
+        DEFAULT_MAX_TOKENS,
+        step=256,
+        key="max_tokens",
+        disabled=locked,
+        help=f"Giới hạn cứng: tối đa {MAX_ROUNDS} vòng và {MAX_TOKENS_CAP} token/lượt.",
+    )
+    st.toggle(
+        "Chế độ demo (mock, không gọi API)",
+        value=os.getenv("AI_DEBATE_MOCK") == "1",
+        key="mock",
+        disabled=locked,
+    )
+    st.caption(
+        f"Mỗi phiên gồm {2 * ss.rounds + 1} lượt gọi model "
+        f"(tối đa ~{(2 * ss.rounds + 1) * ss.max_tokens:,} token output)."
+    )
+
+# ---- main ------------------------------------------------------------------
+st.title("⚖️ AI Debate")
+st.caption(
+    "Claude và Gemini thảo luận task của bạn: một bên đề xuất, một bên phản biện, rồi tổng hợp."
+)
+
+st.text_area(
+    "Task",
+    key="task",
+    height=120,
+    placeholder="Ví dụ: Lập kế hoạch 4 tuần học Python cho người mới, mỗi ngày 1 giờ.",
+    disabled=ss.running,
+)
+b1, b2, _ = st.columns([1, 1, 4])
+b1.button("▶ Chạy", on_click=on_run, disabled=ss.running, type="primary", width="stretch")
+b2.button("⏹ Dừng", on_click=on_stop, disabled=not ss.running, width="stretch")
+
+if ss.form_error:
+    st.error(ss.form_error)
+
+status_box = st.container()
+metrics = st.empty()
+st.subheader("Hội thoại")
+conv = st.container()
+st.subheader("Kết quả cuối")
+final_box = st.container(border=True)
+
+debate: Debate | None = ss.debate
+render_metrics(metrics, debate)
+
+if debate is None:
+    conv.info("Nhập task rồi bấm **Chạy** để bắt đầu.")
+elif ss.running and debate.status == "pending":
+    run_live(debate, conv, final_box, metrics)
+    ss.running = False
+    save_once(debate)
+    st.rerun()
+else:
+    for turn in debate.turns:
+        body, notes = open_turn(turn, final_box if turn.role == "synthesizer" else conv)
+        show_turn_body(turn, body, notes)
+    save_once(debate)
+    with final_box:
+        if debate.final_text:
+            render_final(debate)
+        else:
+            st.caption("Chưa có kết quả cuối.")
+    with status_box:
+        if debate.status == "stopped":
+            st.warning("Đã dừng theo yêu cầu. Phần hội thoại đã có vẫn được lưu.")
+        elif debate.status == "error":
+            st.error(f"Lỗi khi gọi API: {debate.error}")
+        elif debate.status == "done":
+            st.success("Hoàn tất.")
+        if ss.saved_paths:
+            names = ", ".join(p.name for p in ss.saved_paths)
+            st.caption(f"Log phiên: `logs/` → {names}")
