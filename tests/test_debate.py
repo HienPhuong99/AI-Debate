@@ -203,7 +203,7 @@ def test_save_log_writes_json_and_md(tmp_path):
     data = json.loads(json_path.read_text(encoding="utf-8"))
     assert data["status"] == "done" and data["final"]
     assert len(data["turns"]) == 3
-    assert "viết-email" in json_path.name
+    assert json_path.name.endswith("_viet-email-xin-nghi-phep.json")
     md = md_path.read_text(encoding="utf-8")
     assert "Viết email xin nghỉ phép" in md and "Kết quả cuối" in md
     assert "Kết quả cuối" in debate.final_markdown()

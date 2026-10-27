@@ -32,7 +32,7 @@ pytest `tests/test_debate.py`: **25/25 PASS** (lịch lượt, đổi vai, giớ
 
 ## 4. Lỗi / hạn chế còn lại
 
-- Bấm **Dừng** khi đang gọi API thật: token của lượt đang chạy dở vẫn bị tính tiền, nhưng app không hiển thị được vì số token chỉ có khi stream kết thúc.
+- ~~Bấm Dừng: token của lượt dở không hiển thị~~ → đợt 2 đã thêm ước tính (xem `BAO_CAO_TINH_NANG.md`).
 - Lượt bị lỗi hiển thị "(trống) · Lượt này chưa xong" — chỉ là chi tiết hiển thị, không ảnh hưởng luồng.
 - Mỗi lượt gửi lại toàn bộ hội thoại (không dùng prompt caching) — ở mức ≤ 5 vòng thì chấp nhận được.
 

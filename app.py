@@ -5,6 +5,7 @@ Chạy: streamlit run app.py
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -16,14 +17,19 @@ from core.claude_client import CLAUDE_MODELS, DEFAULT_CLAUDE_MODEL, ClaudeClient
 from core.debate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_ROUNDS,
+    DEFAULT_TOKEN_BUDGET,
     MAX_ROUNDS,
+    MAX_TOKEN_BUDGET,
     MAX_TOKENS_CAP,
     MIN_MAX_TOKENS,
     MIN_ROUNDS,
+    MIN_TOKEN_BUDGET,
     MIN_WEAKNESSES,
     Debate,
     DebateConfig,
     Turn,
+    format_usd,
+    list_logs,
     save_log,
 )
 from core.gemini_client import DEFAULT_GEMINI_MODEL, GEMINI_MODELS, GeminiClient
@@ -34,14 +40,22 @@ LOGS_DIR = APP_DIR / "logs"
 load_dotenv(APP_DIR / ".env")
 
 AVATARS = {"Claude": "🟠", "Gemini": "🔵"}
+EXAMPLE_TASKS = [
+    "Lập kế hoạch 4 tuần học Python cho người mới, mỗi ngày 1 giờ.",
+    "Thiết kế quy trình onboarding 2 tuần cho nhân viên mới ở công ty 20 người.",
+    "Viết email xin tăng lương ngắn gọn, lịch sự, có số liệu đóng góp.",
+    "So sánh PostgreSQL và MongoDB cho app quản lý đơn hàng nhỏ, đưa ra khuyến nghị.",
+]
+STATUS_LABELS = {"done": "✅ xong", "stopped": "⏹ đã dừng", "error": "❌ lỗi", "running": "… dở"}
 
 st.set_page_config(page_title="AI Debate", page_icon="⚖️", layout="wide")
 # Model replies use Markdown headings; keep them from dwarfing the page.
 st.markdown(
     """<style>
-    [data-testid="stChatMessage"] h1 { font-size: 1.35rem; }
-    [data-testid="stChatMessage"] h2 { font-size: 1.15rem; }
-    [data-testid="stChatMessage"] h3, [data-testid="stChatMessage"] h4 { font-size: 1.0rem; }
+    [data-testid="stChatMessage"] h1, .st-key-history_view h1 { font-size: 1.35rem; }
+    [data-testid="stChatMessage"] h2, .st-key-history_view h2 { font-size: 1.15rem; }
+    [data-testid="stChatMessage"] h3, [data-testid="stChatMessage"] h4,
+    .st-key-history_view h3, .st-key-history_view h4 { font-size: 1.0rem; }
     </style>""",
     unsafe_allow_html=True,
 )
@@ -84,6 +98,7 @@ def on_run() -> None:
             max_tokens=ss.max_tokens,
             proposer=ss.proposer,
             synthesizer=ss.synthesizer,
+            token_budget=ss.token_budget,
         )
         clients = build_clients(ss.mock)
     except (ValueError, LLMError) as e:
@@ -99,9 +114,13 @@ def on_stop() -> None:
     # Clicking any widget interrupts the running script; this callback runs first on the rerun.
     ss.stop_requested = True
     ss.running = False
-    debate = ss.debate
-    if debate is not None and debate.status == "running":
-        debate._finish("stopped")
+    if ss.debate is not None:
+        ss.debate.stop()
+
+
+def on_pick_example() -> None:
+    if ss.example:
+        ss.task = ss.example
 
 
 def save_once(debate: Debate) -> None:
@@ -116,7 +135,8 @@ def save_once(debate: Debate) -> None:
 def render_metrics(target, debate: Debate | None) -> None:
     usage = debate.usage_by_provider if debate else {}
     with target.container():
-        cols = st.columns(3)
+        cols = st.columns(4)
+        costs = debate.cost_by_provider if debate else {}
         for col, provider in zip(cols, ("Claude", "Gemini"), strict=False):
             u = usage.get(provider)
             col.metric(
@@ -125,8 +145,20 @@ def render_metrics(target, debate: Debate | None) -> None:
                 help="Tổng input + output (gồm cả token suy nghĩ)",
             )
             if u:
-                col.caption(f"vào {u.input_tokens:,} · ra {u.output_tokens:,}")
-        cols[2].metric("Tổng token", f"{debate.total_usage.total:,}" if debate else "0")
+                col.caption(
+                    f"vào {u.input_tokens:,} · ra {u.output_tokens:,} · "
+                    f"{format_usd(costs.get(provider))}"
+                )
+        total = debate.total_usage.total if debate else 0
+        cols[2].metric("Tổng token", f"{total:,}")
+        if debate:
+            budget = debate.config.token_budget
+            cols[2].progress(min(total / budget, 1.0), text=f"ngân sách {budget:,}")
+        cols[3].metric(
+            "Chi phí ước tính",
+            format_usd(debate.total_cost) if debate else "$0",
+            help="Theo bảng giá chính thức (tier trả phí chuẩn). Chế độ demo: giá giả định.",
+        )
 
 
 def turn_notes(turn: Turn) -> list[str]:
@@ -138,6 +170,8 @@ def turn_notes(turn: Turn) -> list[str]:
     if turn.role == "critic" and turn.weakness_count is not None:
         if turn.weakness_count < MIN_WEAKNESSES:
             notes.append(f"⚠️ Chỉ nêu {turn.weakness_count} điểm yếu (yêu cầu ≥ {MIN_WEAKNESSES}).")
+    if turn.usage_estimated:
+        notes.append("≈ Token của lượt này là ước tính (bị dừng trước khi API báo số thật).")
     if not turn.done:
         notes.append("⏹ Lượt này chưa xong.")
     return notes
@@ -164,18 +198,25 @@ def show_turn_body(turn: Turn, body, notes) -> None:
 
 def run_live(debate: Debate, conv, final_box, metrics) -> None:
     slots = {}
-    for event in debate.run(should_stop=lambda: ss.stop_requested):
-        kind, turn = event[0], event[1]
-        if kind == "turn_start":
-            slots[id(turn)] = open_turn(turn, final_box if turn.role == "synthesizer" else conv)
-        body, notes = slots[id(turn)]
-        if kind == "chunk":
-            body.markdown(turn.text + " ▌")
-        elif kind == "turn_reset":
-            body.info("Phản biện chưa nêu đủ điểm yếu — đang yêu cầu làm lại…")
-        elif kind == "turn_end":
-            show_turn_body(turn, body, notes)
-            render_metrics(metrics, debate)
+    events = debate.run(should_stop=lambda: ss.stop_requested)
+    try:
+        for event in events:
+            kind, turn = event[0], event[1]
+            if kind == "turn_start":
+                box = final_box if turn.role == "synthesizer" else conv
+                slots[id(turn)] = open_turn(turn, box)
+            body, notes = slots[id(turn)]
+            if kind == "chunk":
+                body.markdown(turn.text + " ▌")
+            elif kind == "turn_reset":
+                body.info("Phản biện chưa nêu đủ điểm yếu — đang yêu cầu làm lại…")
+            elif kind == "turn_end":
+                show_turn_body(turn, body, notes)
+                render_metrics(metrics, debate)
+    finally:
+        # "Dừng" interrupts this script mid-loop; close the engine now (not at some later GC)
+        # so a turn cut off between chunks is marked stopped and its tokens estimated.
+        events.close()
 
 
 def render_final(debate: Debate) -> None:
@@ -183,7 +224,7 @@ def render_final(debate: Debate) -> None:
     if not final:
         return
     stamp = f"{debate.started_at:%Y%m%d-%H%M%S}"
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     c1.download_button(
         "⬇️ Tải kết quả cuối (.md)",
         data=debate.final_markdown(),
@@ -198,6 +239,14 @@ def render_final(debate: Debate) -> None:
         data=debate.to_markdown(),
         file_name=f"hoi-thoai-{stamp}.md",
         mime="text/markdown",
+        on_click="ignore",
+        width="stretch",
+    )
+    c3.download_button(
+        "⬇️ Tải log (.json)",
+        data=json.dumps(debate.to_dict(), ensure_ascii=False, indent=2),
+        file_name=f"phien-{stamp}.json",
+        mime="application/json",
         on_click="ignore",
         width="stretch",
     )
@@ -246,6 +295,16 @@ with st.sidebar:
         disabled=locked,
         help=f"Giới hạn cứng: tối đa {MAX_ROUNDS} vòng và {MAX_TOKENS_CAP} token/lượt.",
     )
+    st.number_input(
+        "Ngân sách token cả phiên",
+        MIN_TOKEN_BUDGET,
+        MAX_TOKEN_BUDGET,
+        DEFAULT_TOKEN_BUDGET,
+        step=5_000,
+        key="token_budget",
+        disabled=locked,
+        help="Vượt ngân sách thì bỏ các vòng còn lại và chuyển thẳng sang tổng hợp.",
+    )
     st.toggle(
         "Chế độ demo (mock, không gọi API)",
         value=os.getenv("AI_DEBATE_MOCK") == "1",
@@ -263,26 +322,86 @@ st.caption(
     "Claude và Gemini thảo luận task của bạn: một bên đề xuất, một bên phản biện, rồi tổng hợp."
 )
 
-st.text_area(
-    "Task",
-    key="task",
-    height=120,
-    placeholder="Ví dụ: Lập kế hoạch 4 tuần học Python cho người mới, mỗi ngày 1 giờ.",
-    disabled=ss.running,
-)
-b1, b2, _ = st.columns([1, 1, 4])
-b1.button("▶ Chạy", on_click=on_run, disabled=ss.running, type="primary", width="stretch")
-b2.button("⏹ Dừng", on_click=on_stop, disabled=not ss.running, width="stretch")
+tab_run, tab_history = st.tabs(["Phiên hiện tại", "Lịch sử"])
 
-if ss.form_error:
-    st.error(ss.form_error)
 
-status_box = st.container()
-metrics = st.empty()
-st.subheader("Hội thoại")
-conv = st.container()
-st.subheader("Kết quả cuối")
-final_box = st.container(border=True)
+def render_history() -> None:
+    sessions = list_logs(LOGS_DIR)
+    if not sessions:
+        st.info("Chưa có phiên nào trong `logs/`.")
+        return
+    st.caption(f"{len(sessions)} phiên đã lưu trong `logs/` (mới nhất trước).")
+
+    def label(i: int) -> str:
+        item = sessions[i]
+        task = item["task"] if len(item["task"]) <= 60 else item["task"][:57] + "…"
+        when = item["started_at"].replace("T", " ")
+        status = STATUS_LABELS.get(item["status"], item["status"])
+        return f"{when} · {status} · {item['tokens']:,} token · {task}"
+
+    choice = st.selectbox("Chọn phiên", range(len(sessions)), format_func=label, key="history_pick")
+    item = sessions[choice]
+    md = item["md"].read_text(encoding="utf-8") if item["md"].exists() else "(thiếu file .md)"
+    c1, c2, _ = st.columns([1, 1, 2])
+    c1.download_button(
+        "⬇️ Tải .md",
+        data=md,
+        file_name=item["md"].name,
+        mime="text/markdown",
+        on_click="ignore",
+        width="stretch",
+        key="history_md",
+    )
+    c2.download_button(
+        "⬇️ Tải .json",
+        data=item["json"].read_text(encoding="utf-8"),
+        file_name=item["json"].name,
+        mime="application/json",
+        on_click="ignore",
+        width="stretch",
+        key="history_json",
+    )
+    st.caption(f"Chi phí ước tính: {format_usd(item['cost'])}")
+    with st.container(border=True, key="history_view"):
+        st.markdown(md)
+
+
+# History is drawn first: a live run below blocks the script until it finishes.
+with tab_history:
+    if ss.running:
+        st.info("Đang chạy một phiên — xem lịch sử sau khi xong.")
+    else:
+        render_history()
+
+with tab_run:
+    st.selectbox(
+        "Task mẫu",
+        [""] + EXAMPLE_TASKS,
+        key="example",
+        on_change=on_pick_example,
+        format_func=lambda x: x or "— chọn nhanh một task mẫu —",
+        disabled=ss.running,
+    )
+    st.text_area(
+        "Task",
+        key="task",
+        height=120,
+        placeholder="Ví dụ: Lập kế hoạch 4 tuần học Python cho người mới, mỗi ngày 1 giờ.",
+        disabled=ss.running,
+    )
+    b1, b2, _ = st.columns([1, 1, 4])
+    b1.button("▶ Chạy", on_click=on_run, disabled=ss.running, type="primary", width="stretch")
+    b2.button("⏹ Dừng", on_click=on_stop, disabled=not ss.running, width="stretch")
+
+    if ss.form_error:
+        st.error(ss.form_error)
+
+    status_box = st.container()
+    metrics = st.empty()
+    st.subheader("Hội thoại")
+    conv = st.container()
+    st.subheader("Kết quả cuối")
+    final_box = st.container(border=True)
 
 debate: Debate | None = ss.debate
 render_metrics(metrics, debate)
@@ -311,6 +430,11 @@ else:
             st.error(f"Lỗi khi gọi API: {debate.error}")
         elif debate.status == "done":
             st.success("Hoàn tất.")
+        if debate.budget_hit:
+            st.info(
+                f"Đã chạm ngân sách {debate.config.token_budget:,} token nên bỏ các vòng còn lại "
+                "và chuyển thẳng sang tổng hợp."
+            )
         if ss.saved_paths:
             names = ", ".join(p.name for p in ss.saved_paths)
             st.caption(f"Log phiên: `logs/` → {names}")

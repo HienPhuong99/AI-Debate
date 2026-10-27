@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from core.base import LLMClient, LLMError, Usage
+from core.pricing import cost_usd
 
 # Hard limits so a run can never cost more than expected.
 MIN_ROUNDS = 1
@@ -20,6 +22,10 @@ MAX_TOKENS_CAP = 4096
 DEFAULT_MAX_TOKENS = 2048
 MAX_TASK_CHARS = 8000
 MIN_WEAKNESSES = 2
+# Session-wide token budget (input + output across both models).
+MIN_TOKEN_BUDGET = 5_000
+MAX_TOKEN_BUDGET = 200_000
+DEFAULT_TOKEN_BUDGET = 60_000
 
 PROVIDERS = ("Claude", "Gemini")
 
@@ -77,6 +83,7 @@ class DebateConfig:
     max_tokens: int = DEFAULT_MAX_TOKENS
     proposer: str = "Claude"
     synthesizer: str = "Claude"
+    token_budget: int = DEFAULT_TOKEN_BUDGET
 
     def __post_init__(self) -> None:
         self.task = (self.task or "").strip()
@@ -88,6 +95,7 @@ class DebateConfig:
             raise ValueError("Bên đề xuất/tổng hợp phải là Claude hoặc Gemini.")
         self.rounds = clamp(self.rounds, MIN_ROUNDS, MAX_ROUNDS)
         self.max_tokens = clamp(self.max_tokens, MIN_MAX_TOKENS, MAX_TOKENS_CAP)
+        self.token_budget = clamp(self.token_budget, MIN_TOKEN_BUDGET, MAX_TOKEN_BUDGET)
 
     @property
     def critic(self) -> str:
@@ -105,6 +113,7 @@ class Turn:
     truncated: bool = False
     weakness_count: int | None = None
     retried: bool = False
+    usage_estimated: bool = False  # usage guessed from text length (turn was cut off)
     done: bool = False
 
     @property
@@ -132,6 +141,8 @@ class Debate:
         self.error: str | None = None
         self.started_at = datetime.now()
         self.finished_at: datetime | None = None
+        self.budget_hit = False
+        self._current_prompt = ""
 
     # ---- results -------------------------------------------------------
     @property
@@ -147,6 +158,21 @@ class Debate:
         for usage in self.usage_by_provider.values():
             total.add(usage)
         return total
+
+    @property
+    def cost_by_provider(self) -> dict[str, float | None]:
+        """Estimated USD per provider; None if any turn used a model without a known price."""
+        costs: dict[str, float | None] = {p: 0.0 for p in PROVIDERS}
+        for turn in self.turns:
+            cost = cost_usd(turn.model, turn.usage, self.started_at.date())
+            current = costs[turn.speaker]
+            costs[turn.speaker] = None if cost is None or current is None else current + cost
+        return costs
+
+    @property
+    def total_cost(self) -> float | None:
+        values = list(self.cost_by_provider.values())
+        return None if None in values else sum(values)
 
     @property
     def final_text(self) -> str | None:
@@ -207,11 +233,14 @@ class Debate:
         }
         try:
             for round_no, role, speaker in self._schedule():
+                if self.budget_hit and role != "synthesizer":
+                    continue  # over budget: skip the remaining rounds, go to synthesis
                 client = self.clients[speaker]
                 turn = Turn(round=round_no, role=role, speaker=speaker, model=client.model)
+                prompt = self._prompt(role, round_no)
+                self._current_prompt = prompt
                 self.turns.append(turn)
                 yield ("turn_start", turn)
-                prompt = self._prompt(role, round_no)
                 attempts = 2 if role == "critic" else 1
                 for attempt in range(attempts):
                     if attempt:
@@ -225,6 +254,7 @@ class Debate:
                         )
                     for chunk in client.stream(systems[role], prompt, self.config.max_tokens):
                         if should_stop():
+                            self._estimate_partial(turn, prompt)
                             self._finish("stopped")
                             return
                         turn.text += chunk
@@ -237,6 +267,8 @@ class Debate:
                     if turn.weakness_count >= MIN_WEAKNESSES:
                         break
                 turn.done = True
+                if role != "synthesizer" and self.total_usage.total >= self.config.token_budget:
+                    self.budget_hit = True
                 yield ("turn_end", turn)
                 if should_stop():
                     self._finish("stopped")
@@ -245,7 +277,35 @@ class Debate:
             self.error = str(e)
             self._finish("error")
             return
+        except BaseException:
+            # Cut off from outside: the UI closed us (GeneratorExit) or Streamlit raised its
+            # StopException inside the running stream when "Dừng" was clicked.
+            last = self.turns[-1] if self.turns else None
+            if last is not None and not last.done:
+                self._estimate_partial(last, self._current_prompt)
+            if self.status == "running":
+                self._finish("stopped")
+            raise
         self._finish("done")
+
+    def stop(self) -> None:
+        """Stop from outside the engine (UI "Dừng"): settle status and the cut-off turn now.
+
+        Streamlit starts the next script run before the interrupted one has unwound, so the
+        UI must not wait for the engine to notice the stop before saving or rendering.
+        """
+        last = self.turns[-1] if self.turns else None
+        if last is not None and not last.done:
+            self._estimate_partial(last, self._current_prompt)
+        if self.status in ("pending", "running"):
+            self._finish("stopped")
+
+    @staticmethod
+    def _estimate_partial(turn: Turn, prompt: str) -> None:
+        """Providers report usage only at the end of a stream; guess it (~4 chars/token)."""
+        if turn.usage.total == 0:
+            turn.usage = Usage(len(prompt) // 4, len(turn.text) // 4)
+            turn.usage_estimated = True
 
     def _finish(self, status: str) -> None:
         self.status = status
@@ -263,6 +323,8 @@ class Debate:
             "config": asdict(self.config),
             "models": {p: c.model for p, c in self.clients.items()},
             "usage": {p: asdict(u) for p, u in self.usage_by_provider.items()},
+            "cost_usd": self.cost_by_provider,
+            "budget_hit": self.budget_hit,
             "turns": [asdict(t) for t in self.turns],
             "final": self.final_text,
         }
@@ -273,7 +335,8 @@ class Debate:
         return (
             f"# Kết quả AI Debate\n\n**Task:** {cfg.task}\n\n"
             f"_Tổng hợp bởi {cfg.synthesizer} · {cfg.rounds} vòng · "
-            f"{usage.total:,} token_\n\n---\n\n{self.final_text or '(chưa có kết quả cuối)'}\n"
+            f"{usage.total:,} token · {format_usd(self.total_cost)}_\n\n---\n\n"
+            f"{self.final_text or '(chưa có kết quả cuối)'}\n"
         )
 
     def to_markdown(self) -> str:
@@ -286,8 +349,15 @@ class Debate:
             f"- Số vòng: {cfg.rounds} · max_tokens/lượt: {cfg.max_tokens}",
             f"- Đề xuất: {cfg.proposer} · Phản biện: {cfg.critic} · Tổng hợp: {cfg.synthesizer}",
         ]
+        costs = self.cost_by_provider
         for provider, u in self.usage_by_provider.items():
-            lines.append(f"- Token {provider}: vào {u.input_tokens:,} / ra {u.output_tokens:,}")
+            lines.append(
+                f"- Token {provider}: vào {u.input_tokens:,} / ra {u.output_tokens:,}"
+                f" · {format_usd(costs[provider])}"
+            )
+        lines.append(f"- Chi phí ước tính: {format_usd(self.total_cost)}")
+        if self.budget_hit:
+            lines.append(f"- Chạm ngân sách {cfg.token_budget:,} token → bỏ các vòng còn lại")
         lines += ["", "## Task", "", cfg.task, ""]
         for turn in self.turns:
             note = "" if turn.done else " _(chưa xong)_"
@@ -295,8 +365,17 @@ class Debate:
         return "\n".join(lines)
 
 
+def format_usd(value: float | None) -> str:
+    if value is None:
+        return "chưa rõ giá"
+    return f"~${value:.4f}" if value < 1 else f"~${value:,.2f}"
+
+
 def _slug(text: str, limit: int = 40) -> str:
-    slug = re.sub(r"[^\w]+", "-", text.lower(), flags=re.UNICODE).strip("-")
+    """ASCII-only slug: non-ASCII file names break browser downloads and some Windows tools."""
+    text = text.lower().replace("đ", "d")
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
     return slug[:limit].strip("-") or "task"
 
 
@@ -305,6 +384,13 @@ def save_log(debate: Debate, logs_dir: str | Path = "logs") -> tuple[Path, Path]
     folder = Path(logs_dir)
     folder.mkdir(parents=True, exist_ok=True)
     stem = f"{debate.started_at:%Y%m%d-%H%M%S}_{_slug(debate.config.task)}"
+    if getattr(debate, "_log_stem", None):
+        stem = debate._log_stem  # re-saving the same session overwrites its own files
+    else:
+        base, n = stem, 2
+        while (folder / f"{stem}.json").exists():
+            stem, n = f"{base}-{n}", n + 1
+        debate._log_stem = stem
     json_path = folder / f"{stem}.json"
     md_path = folder / f"{stem}.md"
     json_path.write_text(
@@ -312,3 +398,30 @@ def save_log(debate: Debate, logs_dir: str | Path = "logs") -> tuple[Path, Path]
     )
     md_path.write_text(debate.to_markdown(), encoding="utf-8")
     return json_path, md_path
+
+
+def list_logs(logs_dir: str | Path = "logs") -> list[dict]:
+    """Saved sessions, newest first: {json, md, started_at, task, status, tokens, cost}."""
+    folder = Path(logs_dir)
+    sessions = []
+    for json_path in sorted(folder.glob("*.json"), reverse=True):
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            usage = data.get("usage") or {}
+            costs = (data.get("cost_usd") or {}).values()
+            sessions.append(
+                {
+                    "json": json_path,
+                    "md": json_path.with_suffix(".md"),
+                    "started_at": data.get("started_at", ""),
+                    "task": (data.get("config") or {}).get("task", ""),
+                    "status": data.get("status", "?"),
+                    "tokens": sum(
+                        u.get("input_tokens", 0) + u.get("output_tokens", 0) for u in usage.values()
+                    ),
+                    "cost": None if not costs or None in costs else sum(costs),
+                }
+            )
+        except (OSError, ValueError, AttributeError):
+            continue  # skip unreadable or foreign files
+    return sessions
